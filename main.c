@@ -21,6 +21,13 @@ struct LinkedList {
     struct Node* head;
 };
 
+struct Flags 
+{
+    int exitFlag1;
+    int exitFlag2;
+};
+
+
 void addElement(struct LinkedList* list, const char* data) {
     struct Node* newNode = (struct Node*)malloc(sizeof(struct Node));
     strncpy(newNode->data, data, BUFFER_MAX_LENGTH - 1);
@@ -80,7 +87,7 @@ int countChars(char line[BUFFER_MAX_LENGTH]){
 }
 
 void getLines(struct LinkedList *list, pid_t process2, int pipep1p2[2], sem_t *semP1, sem_t *semP2) {
-
+    //printf("Start of getline()\n");
     FILE *file;
     close(pipep1p2[0]);
 
@@ -90,30 +97,32 @@ void getLines(struct LinkedList *list, pid_t process2, int pipep1p2[2], sem_t *s
         perror("Error opening file");
         return;
     }
-
+    //printf("Before first getline() loop\n");
     while (fgets(line, sizeof(line), file) != NULL) {
         addElement(list, line);
-
+        //printf("Added element\n");
         if (countElements(list) > 1) {
             char *firstElement = getFirstElement(list);
             if (firstElement != NULL) {
                 write(pipep1p2[1], firstElement, sizeof(line));
+                //printf("Before sem2 post getline()\n");
                 sem_post(semP2);
                 free(firstElement);
             }
+            //printf("Before semp1 wait getline()\n");
             sem_wait(semP1);
+            //printf("After semp1 wait getline()\n");
         }
     }
-
+    //printf("End of first loop in getline()\n");
     if (countElements(list) > 0) {
         char *lastElement = getFirstElement(list);
         if (lastElement != NULL) {
             write(pipep1p2[1], lastElement, sizeof(line));
-            sem_post(semP2);
             free(lastElement);
         }
     }
-
+    //printf("End of getline()\n");
     close(pipep1p2[1]);
     fclose(file);
 }
@@ -127,7 +136,19 @@ int main() {
     sem_t *semP2 = sem_open("semP2", O_CREAT, 0666, 0);
     sem_t *semP3 = sem_open("semP3", O_CREAT, 0666, 0);
     key_t memKey = 1234;
+    key_t flagMemKey = 5678;
     int shmid = shmget(memKey, BUFFER_MAX_LENGTH, IPC_CREAT | 0666);
+    int shmid2 = shmget(flagMemKey, sizeof(struct Flags), IPC_CREAT | 0666);
+    struct Flags *exitFlags = (struct Flags*)shmat(shmid2, NULL, 0);
+    if (exitFlags == (void*)(-1))
+    {
+        perror("Flags shmat error");
+        return 1;
+    }
+    exitFlags->exitFlag1 = 0;
+    exitFlags->exitFlag2 = 0;
+
+
     int pipep1p2[2];
     if (pipe(pipep1p2) == -1) {
         perror("Błąd tworzenia potoku p1-p2");
@@ -137,13 +158,31 @@ int main() {
     {
         perror("Błąd tworzenia pamięci dzielonej");
         return 1;
-    }    
+    }
+    if (shmid2 == -1)
+    {
+        perror("Błąd tworzenia pamięci dzielonej 2");
+        return 1;
+    }
+    
     process1 = fork();
     if (process1 == -1) {
         perror("Błąd tworzenia procesu 1");
         return 1;
     } else if (process1 == 0) {
+        struct Flags *exitFlags = (struct Flags*)shmat(shmid2, NULL, 0);
+        if (exitFlags == (void*)(-1))
+        {
+            perror("Flags shmat error");
+            return 1;
+        }
         getLines(&linkedList, process2, pipep1p2, semP1, semP2);
+        //printf("Przed ustawieniem flagi i przed semp2 wait w proces1\n");
+        exitFlags->exitFlag1 = 1;
+        //printf("Flaga ustawiona koniec 1\n");
+        sem_post(semP2);
+        //printf("Flaga ustawiona sem2 post proces1\n");
+        shmdt(exitFlags);
         exit(EXIT_SUCCESS);
     } else {
         process2 = fork();
@@ -151,6 +190,14 @@ int main() {
             perror("Błąd tworzenia procesu 2");
             return 1;
         } else if (process2 == 0) {
+            //printf("Process 2 beginning\n");
+            struct Flags *exitFlags = (struct Flags*)shmat(shmid2, NULL, 0);
+            if (exitFlags == (void*)(-1))
+            {
+                perror("Flags shmat error");
+                return 1;
+            }
+            //printf("Before first wait in process2\n");
             sem_wait(semP2);
             close(pipep1p2[1]);
             char buffer[BUFFER_MAX_LENGTH];
@@ -166,8 +213,18 @@ int main() {
                 }
                 strcpy(sharedMessage, message);
                 shmdt(sharedMessage);
+                //printf("Before post sem3\n");
+                if(exitFlags->exitFlag1 == 1){
+                    exitFlags->exitFlag2 = 1;
+                    sem_post(semP3);
+                    shmdt(exitFlags);
+                    break;
+                }
+                //printf("exitFlag1: %d\n", exitFlags->exitFlag1);
                 sem_post(semP3);
+                //printf("Before wait sem2\n");
                 sem_wait(semP2);
+                
             }
             close(pipep1p2[0]);
             exit(EXIT_SUCCESS);
@@ -179,6 +236,13 @@ int main() {
                 return 1;
             }
             else if(process3 == 0){
+                //printf("Beginning of process3\n");
+                struct Flags *exitFlags = (struct Flags*)shmat(shmid2, NULL, 0);
+                if (exitFlags == (void*)(-1))
+                {
+                    perror("Flags shmat error");
+                    return 1;
+                }
                 sem_wait(semP3);
                 while (1)
                 {
@@ -190,7 +254,15 @@ int main() {
                     }
                     printf("%s\n", sharedMessage);
                     shmdt(sharedMessage);
+                    if (exitFlags->exitFlag1 == 1 && exitFlags->exitFlag2 == 1)
+                    {
+                        shmdt(exitFlags);
+                        break;
+                    }
+                    
+                    //printf("Before semp1 post\n");
                     sem_post(semP1);
+                    //printf("Before semp3 wait\n");
                     sem_wait(semP3);
                 }
                 exit(EXIT_SUCCESS);
@@ -209,6 +281,7 @@ int main() {
                 sem_unlink("semP1");
                 sem_unlink("semP2");
                 sem_unlink("semP3");
+                shmdt(exitFlags);
                 freeLinkedList(&linkedList);
             }
             
